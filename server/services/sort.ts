@@ -8,103 +8,132 @@ import type { SortItem, TreeItem } from '../../types'
 export default ({ strapi }: { strapi: Strapi }) => ({
   async getEntries(key: string, locale?: string | null, sorted = true) {
     const settings = await getPluginService('settings')?.getSettings()
-    const conditions = { sort: { [settings.fieldname["lft"]]: 'ASC' }, populate: settings.fieldname["parent"] }
+    const { lft, rght, parent, tree } = settings.fieldname
+    const conditions = { sort: { [lft]: 'ASC' }, populate: parent }
     if (locale) conditions["locale"] = locale
 
-    const data = await strapi.entityService.findMany(`api::${key}.${key}`, conditions)        
+    const data: any = await strapi.entityService.findMany(`api::${key}.${key}`, conditions)        
     
     data.map((entry: any) => entry.parent = (entry[settings.fieldname["parent"]]) ? entry[settings.fieldname["parent"]]?.id : null)
     
     return (sorted) ? treeTransformer().treeToSort(data) : data
   },
-  async updateEntries(data: { key: string, entries: SortItem[] }, sorted: boolean = true) {
+  async updateEntries(data: { key: string, entries: SortItem[], locale: string | null }, sorted: boolean = true) {
     const settings = await getPluginService('settings')?.getSettings()
     const displayField = await getPluginService('models')?.getDisplayField(data.key)
-    const list = await getPluginService('sort')?.getEntries(data.key, null, false)
+    const list = await this.getEntries(data.key, data.locale, false)
+    const { lft, rght, parent, tree } = settings.fieldname    
 
     if (data.entries.length === 0) {
       data.entries = list
     }    
 
-    const tree = (sorted) ? treeTransformer().sortToTree(data.entries) : data.entries
+    const treeData = (sorted) ? treeTransformer().sortToTree(data.entries) : data.entries    
 
     // Set Tree name
-    tree.map((entry: TreeItem) => {
-      let name = ''
-      let parent = entry.parent
-      while (parent !== null) {
-        const parentEntry = list.find((item: TreeItem) => item.id === parent)
-        if (parentEntry) {
-          name = `${parentEntry[displayField]} > ${name}`
-          parent = parentEntry.parent
-        } else {
-          parent = null
-        }
-      }
-      
+    treeData.map((entry: TreeItem) => {      
       const item = list.find((item: TreeItem) => item.id === entry.id)
-      entry.tree = `${name}${item[displayField]}`
+      entry.tree = this.getTreeName(item, list, displayField)
 
       return entry
     })
 
-    tree.forEach(async (entry: TreeItem) => {
-      // TODO don't trigger beforeUpdate lifecycle
+    treeData.forEach(async (entry: TreeItem) => {
       await strapi.db.query(`api::${data.key}.${data.key}`).update({
         where: { id: entry.id, },
         data: { 
-          [settings.fieldname["lft"]]: entry.lft, 
-          [settings.fieldname["rght"]]: entry.rght, 
-          [settings.fieldname["parent"]]: entry.parent, 
-          [settings.fieldname["tree"]]: entry.tree, 
+          [lft]: entry.lft, 
+          [rght]: entry.rght, 
+          [parent]: entry.parent, 
+          [tree]: entry.tree, 
           primary: false 
         }
       })
     })    
   },
-  async updateOnCreate(model: string, data: any) {    
+  async updateOnCreate(model: string, data: any) {        
     const settings = await getPluginService('settings')?.getSettings()
-    const items = await getPluginService('sort')?.getEntries(model, data.locale ?? null, false)
+    const displayField = await getPluginService('models')?.getDisplayField(model)
+    const items = await this.getEntries(model, data.locale ?? null, false)
+    const { lft, rght, tree } = settings.fieldname
 
-    if (data.parent.connect.length === 0) {
-      const lastItem = items[items.length - 1]
+    // Push data to tree and sort
+    items.push(this.mapDataToTreeItem(data, settings))
+    const sortedItems = treeTransformer().treeToSort(items)
+    let treeData = treeTransformer().sortToTree(sortedItems)
 
-      data[settings.fieldname["lft"]] = lastItem[settings.fieldname["rght"]] + 1
-      data[settings.fieldname["rght"]] = lastItem[settings.fieldname["rght"]] + 2
-    } else {
-      const parentId = data[settings.fieldname["parent"]].connect[0].id
-      const parent = items.find((item: any) => item.id === parentId)
-      if (!parent) return
-
-      // place new item in tree
-      data[settings.fieldname["lft"]] = parent[settings.fieldname["rght"]]
-      data[settings.fieldname["rght"]] = parent[settings.fieldname["rght"]] + 1
-
-      // make place for new item
-      const newData = items.map((item: any) => {
-        if (item.id === parentId) {
-          item[settings.fieldname["rght"]] += 2
-        }
-        if (item[settings.fieldname["lft"]] > data[settings.fieldname["lft"]]) {
-          item[settings.fieldname["lft"]] += 2
-          item[settings.fieldname["rght"]] += 2
-        }
-        return item
-      })
-
-      await getPluginService('sort')?.updateEntries({ key: model, entries: newData }, false)
-    }  
+    // extract tree position and update data
+    const treeItem = treeData.find((item: any) => item.id === data.id)
+    data[lft] = treeItem?.lft
+    data[rght] = treeItem?.rght
+    data[tree] = this.getTreeName(this.mapDataToTreeItem(data, settings), items, displayField)
+    
+    // Update other tree items
+    await this.updateEntries({ key: model, entries: treeData.filter((item) => item.id !== data.id), locale: data.locale ?? null }, false)
 
     return data
+  },
+  async updateOnUpdate(model: string, data: any, locale?: string | null) {
+    
+    const settings = await getPluginService('settings')?.getSettings()    
+    const displayField = await getPluginService('models')?.getDisplayField(model)
+    const items = await this.getEntries(model, locale, false)
+    const item = items.find((item: any) => item.id === data.id)
+    const { lft, rght, parent, tree } = settings.fieldname
+    
+    if (data[parent]?.connect?.length > 0) {
+      if (data[parent].connect[0].id !== item[parent]?.id) {
 
+        // Push data to tree and sort
+        const treeItems = items.filter((item: any) => item.id != data.id)
+        treeItems.push(this.mapDataToTreeItem(data, settings))
+        const sortedItems = treeTransformer().treeToSort(treeItems)
+        let treeData = treeTransformer().sortToTree(sortedItems)
+
+        // extract tree position and update data
+        const treeItem = treeData.find((item: any) => item.id === data.id)        
+        data[lft] = treeItem?.lft
+        data[rght] = treeItem?.rght
+        data[tree] = this.getTreeName(this.mapDataToTreeItem(data, settings), items, displayField)        
+
+        // Update other tree items
+        await this.updateEntries({ key: model, entries: treeData.filter((item) => item.id != data.id), locale: locale }, false)
+      }
+    }
+
+    return data
   },
-  async updateOnUpdate(model: string, data: any) {
-    // TODO Update tree if parent has changed
-  },
-  async updateOnDelete(model: string) {
+  async updateOnDelete(model: string, data: any) {
     if (!model) return
-    const items = await getPluginService('sort')?.getEntries(model)
+    const items = await this.getEntries(model, data.locale ?? null)
     if ( items.length === 0 ) return
-    await getPluginService('sort')?.updateEntries({ key: model, entries: items })    
+    await this.updateEntries({ key: model, entries: items })    
+  },
+  mapDataToTreeItem(entry: any, settings: any) {
+    const { lft, rght, parent, tree } = settings.fieldname
+    return {
+      ...entry,
+      id: entry.id,
+      lft: entry[lft],
+      rght: entry[rght],
+      parent: entry[parent]?.connect?.length > 0 ? entry[parent].connect[0].id : null,
+      tree: entry[tree]
+    }
+  },
+  getTreeName (entry: TreeItem, list: TreeItem[], displayField: string) {
+    let name = ''        
+    let parent = entry?.parent ?? null
+    
+    while ( parent !== null) {
+      const parentEntry = list.find((item: TreeItem) => item.id === parent)
+      if (parentEntry) {
+        name = `${parentEntry[displayField]} > ${name}`
+        parent = parentEntry.parent
+      } else {
+        parent = null
+      }
+    }
+    
+    return `${name}${entry[displayField]}`
   }
 })
